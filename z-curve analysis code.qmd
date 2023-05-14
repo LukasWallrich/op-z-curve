@@ -1,0 +1,725 @@
+---
+title: "Analysis script replicability z-curve"
+format: html
+---
+
+```{r setup}
+# For data manipulation
+library(tidyverse)
+library(rvest)
+library(writexl)
+library(readxl)
+library(lubridate)
+library(magrittr)
+# remotes::install_github("lukasWallrich/timesaveR")
+library(timesaveR) # only available from Github
+
+# For data extraction
+library(rcrossref)
+library(pdftools) #better extraction & more stable than statcheck's own
+library(statcheck)
+library(zcurve)
+library(furrr)
+
+# Helpers
+library(memoise)
+library(cli)
+library(glue)
+
+source("helpers.R")
+
+# Enable caching of CrossRef calls so that the API is not used unnecessarily (only relevant during development)
+cr_journals_m <- memoise(cr_journals)
+```
+
+
+## Steps
+
+1. Sample and screen papers
+2. Extract and screen *p*-values
+3. Run overall *z*-curve, resampling dependent *p*-values and bootstrapping CIs
+4. Run subgroup *z*-curves
+
+## Sample papers
+
+First, add ISSN to the list of included journals.
+
+```{r}
+# Read the journal list from CSV
+journals <- read_csv("journal_list.csv")
+
+# Read AJG 2021 HTML and extract ISSN and journal name
+ajg_list <- read_html("AJG 2021.html") %>% 
+  html_table() %>% .[[1]] %>% 
+  select(issn = 1, journal = 3)
+
+# Join AJG list with the journal list
+journals <- left_join(journals, ajg_list)
+
+# Fix Applied Psychology: An International Review ISSN
+journals$issn[journals$journal == "Applied Psychology: An International Review"] <- "1464-0597"
+
+# Define ISSN replacements
+issn_replace <- c(
+  "1552-4590" = "1069-0727",
+  "1758-7778" = "0268-3946",
+  "1875-9270" = "1051-9815",
+  "1095-9084" = "0001-8791",
+  "1095-9920" = "0749-5978",
+  "2190-6246" = "0932-4089",
+  "1550-3461" = "2769-6863",
+  "1573-3548" = "0894-8453"
+)
+
+# Replace ISSN values in journals
+journals$issn <- ifelse(journals$issn %in% names(issn_replace), 
+                        issn_replace[match(journals$issn, names(issn_replace))],
+                        journals$issn)
+
+# Check ISSN
+check <- journals %$%
+  imap(.progress = TRUE, issn %>% set_names(journal), \(issn, journal) {
+    tibble(issn, journal, cr_journal = cr_journals_m(issn)$data$title)
+  }) %>% bind_rows()
+
+# Check divergent journals - all good, different spellings or renamed Psychologist-Manager Journal
+check %>% filter(!journal == cr_journal)
+```
+
+Then retrieve the population of target articles
+
+```{r}
+
+desired_columns <- c(
+  "DOI", "published", "published-print", "published-online", "title", "author",
+  "page", "container-title", "created", "issue", "volume", "abstract", "type"
+)
+
+retrieve_articles <- function(issn, journal) {
+  works <- tibble()
+
+  # Assess 100 results at a time and stop when year 2022 is passed
+  for (i in 1:10) {
+    new_works <- cr_journals_m(
+      issn = issn,
+      works = TRUE,
+      sort = "published",
+      limit = 100,
+      offset = (i - 1) * 100,
+      select = desired_columns
+    ) %>% 
+      pluck("data")
+
+    if (nrow(new_works) == 0) break
+    
+    # Journals record publication date in different ways - combined here
+    # Where published.print is given, that has precedence - so not all Online First articles are captured
+    # which corresponds to focus on 2022
+    if (!"published.print" %in% names(new_works)) {
+      if ("published" %in% names(new_works)) {
+        new_works <- new_works %>% rename(published.print = published)
+      } else if ("published.online" %in% names(new_works)) {
+        new_works <- new_works %>% rename(published.print = published.online)
+      } else {
+        cli_alert_danger(paste0(journal, 
+                                " does not return published-print or published field.",
+                                " Used `created` (for DOI) to determine year, but that is unreliable."))
+        new_works <- new_works %>% rename(published.print = created)
+      }
+    }
+
+    new_works <- new_works %>% rename(published = published.print)
+
+    if ("published.online" %in% names(new_works)) {
+      new_works$published <- coalesce(new_works$published, new_works$published.online)
+    }
+    
+    new_works <- new_works %>% mutate(year = str_sub(published, 1, 4))
+
+    works <- bind_rows(works, new_works)
+
+    if (min(works$year, na.rm = TRUE) < 1980 | max(works$year, na.rm = TRUE) > 2030) {
+      warning("Publication years might be wrongly extracted for ", journal, ". Check results.")
+    }
+
+    if (min(works$year, na.rm = TRUE) < 2022) break
+  }
+
+  # cli_alert_info(paste0("In '", journal, "' the last 2022 record was at position ", max(which(works$year == 2022))))
+  
+  # Some journals allocate dois for journal-issues - they are removed
+  excluded_types <- setdiff(unique(works$type) %>% na.omit(), c("journal-article", "journal-issue"))
+  if (length(excluded_types) > 0) {
+    cli_alert_warning(paste0("In ", journal, " removed entries with type(s) ", glue_collapse(excluded_types)))
+  }
+
+  works %>%
+    filter(year == 2022, is.na(type) | type == "journal-article") %>% 
+    select(-matches("published"), -type)
+}
+
+all_articles <- journals %$%
+  imap(issn %>% set_names(journal), retrieve_articles) %>% 
+  bind_rows(.id = "journal_name") %>%
+  filter(!str_detect(doi, fixed(".supp")))
+
+write_rds(all_articles, "data/all_articles.rds")
+```
+
+Initial overview
+
+```{r}
+all_articles %>% count(journal_name, sort = T) %>% gt::gt()
+```
+
+
+Then conduct initial sampling.
+
+```{r}
+set.seed(12345) # set random seed - WILL BE SET TO IPA DATE OF RR
+
+# Sampling will be conducted by randomly ranking articles, and then selecting them top-to-bottom
+# This makes replacement of excluded articles easier than repeated random draws from a shrinking population
+
+# Rank articles overall
+all_articles <- all_articles %>% 
+  sample_frac() %>% 
+  mutate(rank = row_number(),
+         status = "not drawn")
+
+# Rank articles within journals
+all_articles <- all_articles %>% 
+  group_by(journal_name) %>% 
+  sample_frac() %>% 
+  mutate(rank_journal = row_number())
+
+# Mark stratified sample (10 articles per journal)
+all_articles <- all_articles %>% 
+    group_by(journal_name) %>% 
+    mutate(status = ifelse(row_number() <= 10,
+                           "sampled_strat",
+                           "not drawn"))
+
+strat_N <- sum(all_articles$status == "sampled_strat")
+
+# Randomly sample additional articles to achieve N = 500
+all_articles <- all_articles %>% group_by(status) %>% 
+  arrange(rank) %>% 
+  mutate(status = ifelse(status == "not drawn" & row_number() <= 500 - strat_N,
+                         "sampled_random", status))
+
+# Validate
+count(all_articles, status)
+
+# Select columns and write the file for screening
+all_articles %>% 
+  arrange(desc(status != "not drawn")) %>% 
+  select(doi, title, abstract, journal_name, status, rank, rank_journal) %>% 
+  mutate(included = "", exclusion_reason = "") %>% 
+  write_xlsx("data/initial_sample.xlsx")
+```
+
+Then screen titles and abstracts for inclusion criteria, and run the following block to resample as needed:
+
+```{r}
+sampled_articles <- read_xlsx("data/initial_sample.xlsx") %>% 
+  mutate(new_status = ifelse(is.na(included) | included != "no", status, "excluded"))
+
+# Create a data frame containing all articles not included in the sample so far
+remaining_pop <- sampled_articles %>% 
+  filter(new_status == "not drawn") %>% 
+  group_by(journal_name) %>% 
+  arrange(rank_journal) %>% 
+  ungroup()
+
+# Identify newly excluded articles and tally them by sample and journal
+exclusions <- sampled_articles %>% 
+  filter(new_status == "excluded" & status != "excluded") %>% 
+  count(status, journal_name)
+
+# Replace excluded articles in the stratified sample from the same journal where possible
+strat_excl <- exclusions %>% filter(status == "sampled_strat")
+
+strat_supp <- map(strat_excl$journal_name %>% set_names(., .), \(journal) {
+  remaining_pop %>% filter(journal_name == journal) %>% 
+    slice_head(n = strat_excl$n[strat_excl$journal_name == journal]) %>% 
+    mutate(new_status = "sampled_strat")
+}) %>% bind_rows()
+
+# Identify where stratified sampling did not succeed as we ran out of articles
+strat_missing <- strat_supp %>% count(journal_name, name = "n_sel") %>% 
+  right_join(strat_excl) %>% 
+  mutate(n_sel = tidyr::replace_na(n_sel, 0), n_rem = n - n_sel)
+
+# Determine how many articles are needed for the random sample and select them randomly from the remaining population
+random_sel <- sum(strat_missing$n_rem) +
+  (exclusions %>% filter(status == "sampled_random") %>% 
+     summarise(sum(n)) %>% pull())
+
+# Update status
+sampled_articles <- sampled_articles %>% 
+  mutate(new_status = ifelse(doi %in% strat_supp$doi,
+                             "sampled_strat", new_status)) %>% 
+  arrange(rank) %>% 
+  group_by(new_status) %>% 
+  mutate(new_status = ifelse(new_status == "not drawn" & row_number() <= random_sel,
+                         "sampled_random", new_status)) %>% 
+  ungroup() %>% 
+  select(-status) %>% 
+  rename(status = new_status)
+
+# Validate
+count(sampled_articles, status)
+
+# Write updated sample
+sampled_articles %>% 
+  arrange(desc(status != "not drawn" & status != "excluded")) %>% 
+  write_xlsx("data/resampled.xlsx")
+```
+
+This will be iterated until we have a sample of 500 eligible articles. Then PDFs will be obtained for the next step.
+
+## Preparing *p*-values
+
+(NB: folder `papers` will be added to `.gitignore` before non-Open Access papers are added.)
+
+```{r}
+fs <- list.files("papers")
+
+# Extract p-values to screen them for inclusion
+all_ps <- map(.progress = TRUE,
+          fs, \(f) {
+  pdf_text(file.path("papers", f)) %>% 
+    paste(collapse = "") %>% 
+    str_remove_all("\n") %>% 
+    statcheck(messages = FALSE, AllPValues = TRUE)
+}) %>% set_names(fs) %>% 
+  bind_rows(.id = "doi") %>% 
+  mutate(include = "")
+
+# Extract p-values that can be recalculated (to replace any reported as <.05 and similar)
+recalculated_ps <- map(.progress = TRUE,
+          fs, \(f) {
+  pdf_text(file.path("papers", f)) %>% 
+    paste(collapse = "") %>% 
+    str_remove_all("\n") %>% 
+    statcheck(messages = FALSE)
+}) %>% set_names(fs) %>% 
+  bind_rows(.id = "doi")
+
+write_csv("data/all_ps.csv")
+write_csv("data/recalculated_ps.csv")
+```
+
+*p*-values will then be screened by comparing them to the hypotheses of each paper, and only retaining those that test a stated hypothesis / answer a stated research question. Where *p*-values are not reported to 3 significant figures, `recalculated_ps` will be checked to see if statcheck can report a precise *p*-value. If not, the paper will be checked and *p* values recalculated manually where possible.
+
+# Analysis
+
+```{r}
+# PARAMETERS
+# We run resampling for means, and then bootstrapping for CIs
+n_res <- 1000
+n_boot <- 5000
+```
+
+
+## Running overall z-curve
+
+The code was developed with data from the recent PNAS nudging meta-analysis, as that data follows the same structure. It contains dependent *p*-values, and some subgroups (though subgroup differences would not be expected here)
+
+```{r}
+# Renaming variables, calculating p-values and selecting variables to bring this in line with our dataset
+## for the subgroup analyses 
+## - binary_outcome is a binary grouping variable (corresponds to OS in our analyses); 
+## - type_experiment has four levels, so used for both other exploratory questions
+
+## TK - resample based on sample or article? Replicability of papers, or studies?
+data <- read_csv("dummy-data/pnas_nudging_meta_data.csv") %>%
+  mutate(p_value = p_from_d(cohens_d, n_control, n_intervention)) %>% 
+  select(doi = reference, study_id, p_value, open_science = binary_outcome, 
+         ajg_rating = type_experiment, research_design = type_experiment)
+
+data_pnas <- data
+
+data <- read_csv("dummy-data/math_anxiety_achievement_data.csv") %>% 
+  filter(Grade < 6, Continent != -999) %>% 
+  transmute(p_value = p_from_r(r, n),
+            doi = paste0("doi", StudyID), study_id = StudyID, 
+            open_science = Pub,
+            ajg_rating = pmax(Grade-1, 1),
+            research_design = case_when(Continent > 4 ~ 2, .default = Continent))
+```
+
+
+```{r}
+# Use parallel processing for bootstrapping
+plan(multisession, workers = 6)
+
+# Resampling dependent p-values for main estimate
+
+resampling_results <- future_map_dfr(.progress = TRUE, .options = furrr_options(seed = 1234567),
+               1:n_res, \(i) {
+  res <- data %>% group_by(study_id) %>% sample_n(1) %>% ungroup()
+  z <- zcurve(p = res$p_value, bootstrap = FALSE)
+  tibble(ERR = z$coefficients["ERR"], EDR = z$coefficients["EDR"], ARP = mean(c(ERR, EDR)))
+})
+
+# Bootstrapping studies after p-value resampling for confidence intervals
+bootstrap_results <- future_map_dfr(.progress = TRUE, .options = furrr_options(seed = 1234567),
+               1:n_boot, \(i) {
+  res <- data %>% group_by(study_id) %>% sample_n(1) %>% ungroup()%>% sample_n(nrow(.), replace = TRUE)
+  z <- zcurve(p = res$p_value, bootstrap = FALSE)
+  tibble(ERR = z$coefficients["ERR"], EDR = z$coefficients["EDR"], ARP = mean(c(ERR, EDR)))
+})
+
+
+# Just to note - in this example, using the first-reported p-values would result in 99%-percentile EDR value
+# So not a robust approach
+  res <- data %>% group_by(study_id) %>% slice_head(n = 1) %>% ungroup()
+  zcurve(p = res$p_value, bootstrap = FALSE)
+
+  report_ci <- function(x) {
+    quantile(x, c(.025, .975)) %>% fmt_pct() %>% {glue::glue("[{.[1]}, {.[2]}]")}
+  }
+  
+
+resampling_results_plots <- future_map(.progress = TRUE, .options = furrr_options(seed = 1234567),
+               1:4, \(i) {
+  res <- data %>% group_by(study_id) %>% sample_n(1) %>% ungroup()
+  zcurve(p = res$p_value, bootstrap = FALSE)
+})
+
+  
+  
+```
+
+Across our sample of `r length(unique(data$doi))` articles, containing `r nrow(data)` p-values, we estimate that `r fmt_pct(mean(resampling_results$ARP))` 95% CI `r report_ci(bootstrap_results$ARP)` of results would replicate. This actual replication prediction is the mean of the expected replication rate (ERR; `r fmt_pct(mean(resampling_results$ERR))` `r report_ci(bootstrap_results$ERR)`) and the expected discovery rate (EDR; `r fmt_pct(mean(resampling_results$EDR))` `r report_ci(bootstrap_results$EDR)`).
+
+## Subgroup analyses 
+
+```{r}
+# Provide list of subgroup dataframes
+estimate_subgroups <- function(group_data, reps, bootstrap = FALSE) {
+  future_map_dfr(.progress = TRUE, .options = furrr_options(seed = 1234567),
+               1:reps, \(i) {
+                 map_dfr(group_data, .id = "group", \(group_data){
+                     res <- group_data %>% group_by(study_id) %>% sample_n(1) %>% ungroup() 
+                     if (bootstrap)
+                       res <- res %>% sample_n(nrow(.), replace = TRUE)
+                     z <- possibly(zcurve, otherwise = tibble())(p = res$p_value, bootstrap = FALSE)
+                     if (is_tibble(z)) {
+                       z
+                     } else {
+                     tibble(ERR = z$coefficients["ERR"], EDR = z$coefficients["EDR"], ARP = mean(c(ERR, EDR)), rep = i)
+                     }
+                 })
+               })
+}
+```
+
+
+### Journal rating (four ordered groups)
+
+```{r}
+# Add journal rating
+# Not used in testing with dummy-data
+# ajg_list <- rvest::read_html("AJG 2021.html") %>% 
+#   rvest::html_table() %>% .[[1]] %>% 
+#   select(journal_name = 3, ajg_rating = 7)
+# ajg_list$journal[ajg_list$journal == "Applied Psychology"] <- "Applied Psychology: An International Review"
+# 
+# ajg_list$ajg_rating <- ajg_list$ajg_rating %>% str_remove(fixed("*"))
+# 
+# data <- left_join(data, ajg_list)
+
+# Split data by ranking
+g <- split(data, data$ajg_rating)
+#Renaming levels (only in dummy data)
+names(g) <- c(4:1)
+group_names <- c(paste0(names(g), "\n(N = ", map(g, nrow), ")") %>% set_names(4:1))
+
+odrs <- map_dfr(g, .id = "group", \(group_data) {
+  group_data %>% summarise(ODR = mean(p_value < .05))
+}) %>% pivot_longer(ODR, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+odr_cis <- map_dfr(g, .id = "group", \(group_data) {
+  group_data %>%
+    summarise(ODR = mean(p_value < .05),
+              ODR_ci_lower = ODR - 1.96 * sqrt((ODR*(1-ODR)/n())),
+              ODR_ci_upper = ODR + 1.96 * sqrt((ODR*(1-ODR)/n())))
+}) %>% select(-ODR) %>% 
+  mutate(metric = "ODR", group = group_names[group])
+
+# Resampling dependent p-values for main estimate
+resampling_results <- estimate_subgroups(g, n_res, bootstrap = FALSE)
+
+resampling_results_deltas <- resampling_results %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+ transmute(rep = rep, 
+            d_ERR_43 = ERR_4 - ERR_3, 
+            d_ERR_32 = ERR_3 - ERR_2,
+            d_ERR_21 = ERR_2 - ERR_1,
+            d_ARP_43 = ARP_4 - ARP_3, 
+            d_ARP_32 = ARP_3 - ARP_2,
+            d_ARP_21 = ARP_2 - ARP_1,
+            d_EDR_43 = EDR_4 - EDR_3, 
+            d_EDR_32 = EDR_3 - EDR_2,
+            d_EDR_21 = EDR_2 - EDR_1)
+
+resampling_results_longer <- resampling_results %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+# Bootstrapping studies after p-value resampling for confidence intervals
+bootstrap_results <- estimate_subgroups(g, n_boot, bootstrap = TRUE)
+
+bootstrap_results_delta <- bootstrap_results %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+    transmute(rep = rep, 
+            d_ERR_43 = ERR_4 - ERR_3, 
+            d_ERR_32 = ERR_3 - ERR_2,
+            d_ERR_21 = ERR_2 - ERR_1,
+            d_ARP_43 = ARP_4 - ARP_3, 
+            d_ARP_32 = ARP_3 - ARP_2,
+            d_ARP_21 = ARP_2 - ARP_1,
+            d_EDR_43 = EDR_4 - EDR_3, 
+            d_EDR_32 = EDR_3 - EDR_2,
+            d_EDR_21 = EDR_2 - EDR_1)
+
+bootstrap_results_longer <- bootstrap_results %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+ci_lower <- function(x) quantile(x, c(.025))
+ci_upper <- function(x) quantile(x, c(.975))
+
+ggplot(resampling_results_longer, aes(group, value, col = metric)) +
+      geom_point(data = odrs, position = position_nudge(-.2), size = 3) +
+  geom_errorbar(data = odr_cis, mapping = aes(y = NULL, ymin = ODR_ci_lower, ymax = ODR_ci_upper), 
+                position = position_nudge(-.2), width = .08) +
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(0.2)) +
+  stat_summary(fun.min = ci_lower, fun.max = ci_upper, geom = "errorbar", width = 0.2, 
+               data = bootstrap_results_longer, position = position_dodge(0.2)) +
+  labs(y = "", x = "", col = "Estimate", title = "Comparison of replicability between AJG rating categories", 
+       caption = "Note: error bars show 95% confidence intervals.") + 
+  scale_y_continuous(labels = scales::percent_format()) + jtools::theme_apa(legend.use.title = TRUE, remove.y.gridlines = FALSE)
+
+
+```
+
+Figure 2 shows the estimated ERR, EDR and ARP for the four ratings of the Academic Journal Guide (due to sample size limitations, we collapsed 4* and 4). Comparing adjacent categories, articles in category 4/4* journals are [more | less | equally - always based on the ΔARP] replicable than articles in category 3 journals (ΔARP = `r fmt_pct(mean(resampling_results_deltas$d_ARP_43))` `r report_ci(bootstrap_results_delta$d_ARP_43)`, ΔERR = `r fmt_pct(mean(resampling_results_deltas$d_ERR_43))` `r report_ci(bootstrap_results_delta$d_ERR_43)`,
+ΔEDR = `r fmt_pct(mean(resampling_results_deltas$d_EDR_43))` `r report_ci(bootstrap_results_delta$d_EDR_43)`);  articles in 3 journals are [more | less | equally] replicable than articles in category 2 journals (ΔARP = `r fmt_pct(mean(resampling_results_deltas$d_ARP_32))` `r report_ci(bootstrap_results_delta$d_ARP_32)`, ΔERR = `r fmt_pct(mean(resampling_results_deltas$d_ERR_32))` `r report_ci(bootstrap_results_delta$d_ERR_32)`,
+ΔEDR = `r fmt_pct(mean(resampling_results_deltas$d_EDR_32))` `r report_ci(bootstrap_results_delta$d_EDR_32)`) and articles in 2 journals are [more | less | equally] replicable than articles in category 1 journals (ΔARP = `r fmt_pct(mean(resampling_results_deltas$d_ARP_21))` `r report_ci(bootstrap_results_delta$d_ARP_21)`,
+ΔERR = `r fmt_pct(mean(resampling_results_deltas$d_ERR_21))` `r report_ci(bootstrap_results_delta$d_ERR_21)`,
+ΔEDR = `r fmt_pct(mean(resampling_results_deltas$d_EDR_21))` `r report_ci(bootstrap_results_delta$d_EDR_21)`). Thus, overall, the replicability of articles in organizational psychology is [positively | negatively | not] associated with the ranking of the journals they appear in.
+
+
+### Open Science support (two groups)
+
+```{r}
+open_science <- data %>% filter(open_science == 1)
+not_open_science <- data %>% filter(open_science == 0)
+
+group_names <- c(open_science = glue::glue("Support for OS\n(N = {length(unique(open_science$doi))})"),
+                 not_open_science = glue::glue("No support for OS\n(N = {length(unique(not_open_science$doi))})"))
+
+
+odrs <- map_dfr(named_list(open_science, not_open_science), .id = "group", \(group_data) {
+  group_data %>% summarise(ODR = mean(p_value < .05))
+}) %>% pivot_longer(ODR, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+odr_cis <- map_dfr(named_list(open_science, not_open_science), .id = "group", \(group_data) {
+  group_data %>%
+    summarise(ODR = mean(p_value < .05),
+              ODR_ci_lower = ODR - 1.96 * sqrt((ODR*(1-ODR)/n())),
+              ODR_ci_upper = ODR + 1.96 * sqrt((ODR*(1-ODR)/n())))
+}) %>% select(-ODR) %>% 
+  mutate(metric = "ODR", group = group_names[group])
+
+
+
+# Resampling dependent p-values for main estimate
+resampling_results <- estimate_subgroups(named_list(open_science, not_open_science), n_res, bootstrap = FALSE)
+
+resampling_results_deltas <- resampling_results %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+  transmute(rep = rep, 
+         d_ERR = ERR_open_science - ERR_not_open_science, 
+         d_ARP = ARP_open_science - ARP_not_open_science, 
+         d_EDR = EDR_open_science - EDR_not_open_science)
+
+
+resampling_results_longer <- resampling_results %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+# Bootstrapping studies after p-value resampling for confidence intervals
+bootstrap_results <- estimate_subgroups(named_list(open_science, not_open_science), n_res, bootstrap = TRUE)
+
+bootstrap_results_delta <- bootstrap_results %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+  transmute(rep = rep, 
+         d_ERR = ERR_open_science - ERR_not_open_science, 
+         d_ARP = ARP_open_science - ARP_not_open_science, 
+         d_EDR = EDR_open_science - EDR_not_open_science)
+
+bootstrap_results_longer <- bootstrap_results %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+ggplot(resampling_results_longer, aes(group, value, col = metric)) +
+  geom_point(data = odrs, position = position_nudge(-.2), size = 3) +
+  geom_errorbar(data = odr_cis, mapping = aes(y = NULL, ymin = ODR_ci_lower, ymax = ODR_ci_upper), 
+                position = position_nudge(-.2), width = .08) +
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(0.2)) +
+  stat_summary(fun.min = ci_lower, fun.max = ci_upper, geom = "errorbar", width = 0.2, 
+               data = bootstrap_results_longer, position = position_dodge(0.2)) +
+  labs(y = "", x = "", col = "Estimate", title = "Comparison of replicability between journals that\nexplicitly support Open Science and those that do not", caption = "Note: OS Support is operationalised as a TOP score greater than 0;\nerror bars show 95% confidence intervals.") + 
+  scale_y_continuous(labels = scales::percent_format()) + jtools::theme_apa(legend.use.title = TRUE, remove.y.gridlines = FALSE)
+
+
+```
+Overall, we found that articles in journals that supported Open Science practices were [more | no more] replicable than articles in journals that did not (ΔARP = `r fmt_pct(mean(resampling_results_deltas$d_ARP))` `r report_ci(bootstrap_results_delta$d_ARP)`, ΔEDR = `r fmt_pct(mean(resampling_results_deltas$d_EDR))` `r report_ci(bootstrap_results_delta$d_EDR)`,ΔERR = `r fmt_pct(mean(resampling_results_deltas$d_ERR))` `r report_ci(bootstrap_results_delta$d_ERR)`)
+
+### Research designs (four clustered groups)
+
+```{r}
+
+# Split data by design
+g <- split(data, data$research_design)
+#Renaming levels (only in dummy data)
+names(g) <- c("exp_field", "exp_lab", "cx_survey", "cx_second")
+
+## Assess two broad categories
+gm <- list(exp = bind_rows(g$exp_field, g$exp_lab),
+           cx = bind_rows(g$cx_survey, g$cx_second))
+
+group_names_m <- c(exp = glue::glue("Experiments\n(N = {length(unique(gm$exp$doi))})"),
+                 cx = glue::glue("Correlational\nstudies\n(N = {length(unique(gm$exp$doi))})"))
+
+group_names <- c(exp_field = glue::glue("Field\n(N = {length(unique(g$exp_field$doi))})"),
+                 exp_lab = glue::glue("Lab\n(N = {length(unique(g$exp_lab$doi))})"),
+                 cx_survey = glue::glue("Surveys\n(N = {length(unique(g$cx_survey$doi))})"),
+                 cx_second = glue::glue("Secondary data\n(N = {length(unique(g$cx_second$doi))})"))
+
+odrs <- bind_rows(
+  map_dfr(g, .id = "group", \(group_data) {
+  group_data %>% summarise(ODR = mean(p_value < .05))
+}) %>% pivot_longer(ODR, names_to = "metric") %>% 
+  mutate(group = group_names[group]),
+ map_dfr(gm, .id = "group", \(group_data) {
+  group_data %>% summarise(ODR = mean(p_value < .05))
+}) %>% pivot_longer(ODR, names_to = "metric") %>% 
+  mutate(group = group_names_m[group])
+)
+
+
+odr_cis <- bind_rows(
+  map_dfr(g, .id = "group", \(group_data) {
+  group_data %>%
+    summarise(ODR = mean(p_value < .05),
+              ODR_ci_lower = ODR - 1.96 * sqrt((ODR*(1-ODR)/n())),
+              ODR_ci_upper = ODR + 1.96 * sqrt((ODR*(1-ODR)/n())))
+}) %>% select(-ODR) %>% 
+  mutate(metric = "ODR", group = group_names[group]),
+ map_dfr(gm, .id = "group", \(group_data) {
+  group_data %>%
+    summarise(ODR = mean(p_value < .05),
+              ODR_ci_lower = ODR - 1.96 * sqrt((ODR*(1-ODR)/n())),
+              ODR_ci_upper = ODR + 1.96 * sqrt((ODR*(1-ODR)/n())))
+}) %>% select(-ODR) %>% 
+  mutate(metric = "ODR", group = group_names_m[group])
+)
+
+
+
+
+# Resampling dependent p-values for main estimate
+resampling_results_m <- estimate_subgroups(gm, n_res, bootstrap = FALSE)
+resampling_results <- estimate_subgroups(g, n_res, bootstrap = FALSE)
+
+resampling_results_deltas_m <- resampling_results_m %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+ transmute(rep = rep, 
+            d_ERR = ERR_exp - ERR_cx, 
+            d_ARP = ARP_exp - ARP_cx, 
+            d_EDR = EDR_exp - EDR_cx)
+
+resampling_results_deltas <- resampling_results %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+  transmute(
+    rep = rep, 
+    d_ERR_exp = ERR_exp_lab - ERR_exp_field, 
+    d_ARP_exp = ARP_exp_lab - ARP_exp_field, 
+    d_ERR_cx = ERR_cx_survey - ERR_cx_second,
+    d_ARP_cx = ARP_cx_survey - ARP_cx_second
+  )
+
+resampling_results_longer_m <- resampling_results_m %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names_m[group])
+
+resampling_results_longer <- resampling_results %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+# Bootstrapping studies after p-value resampling for confidence intervals
+bootstrap_results_m <- estimate_subgroups(gm, n_boot, bootstrap = TRUE)
+bootstrap_results <- estimate_subgroups(g, n_boot, bootstrap = TRUE)
+
+bootstrap_results_delta_m <- bootstrap_results_m %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+  transmute(rep = rep, 
+            d_ERR = ERR_exp - ERR_cx, 
+            d_ARP = ARP_exp - ARP_cx, 
+            d_EDR = EDR_exp - EDR_cx)
+
+bootstrap_results_delta <- bootstrap_results %>% 
+  pivot_wider(names_from = "group", values_from = ERR:ARP) %>% 
+  transmute(
+    rep = rep, 
+    d_ERR_exp = ERR_exp_lab - ERR_exp_field, 
+    d_ARP_exp = ARP_exp_lab - ARP_exp_field, 
+    d_ERR_cx = ERR_cx_survey - ERR_cx_second,
+    d_ARP_cx = ARP_cx_survey - ARP_cx_second
+  )
+
+bootstrap_results_longer_m <- bootstrap_results_m %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names_m[group])
+
+bootstrap_results_longer <- bootstrap_results %>% 
+  pivot_longer(ERR:ARP, names_to = "metric") %>% 
+  mutate(group = group_names[group])
+
+cluster_cis <- bootstrap_results_longer_m %>% 
+  group_by(metric, group) %>% 
+  summarise(ci_low = ci_lower(value), ci_high = ci_upper(value))
+
+bs_longer <- bind_rows(bootstrap_results_longer, bootstrap_results_longer_m)
+rs_longer <- bind_rows(resampling_results_longer, resampling_results_longer_m)
+
+rs_longer <- rs_longer %>% 
+  mutate(group = factor(group, levels = c(group_names_m["exp"], group_names["exp_field"], group_names["exp_lab"],
+                                          group_names_m["cx"], group_names["cx_survey"], group_names["cx_second"])))
+bs_longer <- bs_longer %>% 
+  mutate(group = factor(group, levels = c(group_names_m["exp"], group_names["exp_field"], group_names["exp_lab"],
+                                          group_names_m["cx"], group_names["cx_survey"], group_names["cx_second"])))
+
+ggplot(rs_longer, aes(group, value, col = metric)) +
+    geom_point(data = odrs, position = position_nudge(-.2), size = 3) +
+    geom_errorbar(data = odr_cis, mapping = aes(y = NULL, ymin = ODR_ci_lower, ymax = ODR_ci_upper), 
+                position = position_nudge(-.2), width = .08) +
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(0.2)) +
+  stat_summary(fun.min = ci_lower, fun.max = ci_upper, geom = "errorbar", width = 0.2, 
+               data = bs_longer, position = position_dodge(0.2)) +
+  labs(y = "", x = "", col = "Estimate", title = "Comparison of replicability between research designs") + 
+  scale_y_continuous(labels = scales::percent_format()) + 
+  jtools::theme_apa(legend.use.title = TRUE, remove.y.gridlines = FALSE) +
+  annotate("rect", xmin = c(0.5, 3.5), xmax = c(1.5, 4.5),
+           ymin = 0, ymax = 1,
+           alpha = 0.2, fill = c("grey"))
+```
+
